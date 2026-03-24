@@ -80,10 +80,6 @@ const allProductsToAdmin = async (req, res) => {
   res.json(products);
 };
 
-/**
- * USER: Get products with pagination & filter
- */
-// const getProducts = async (req, res) => {
 //   try {
 //     const { category, page = 1, limit = 6 } = req.query;
 //     const skip = (page - 1) * limit;
@@ -103,32 +99,40 @@ const allProductsToAdmin = async (req, res) => {
 
 const getProducts = async (req, res) => {
   try {
-    // 1️⃣ Get query params
-    const { category, page = 1, limit = 6, sort } = req.query;
+    // 1. Get params and ensure they are Numbers
+    let { search, page = 1, limit = 6, sort } = req.query;
+    page = parseInt(page);
+    limit = parseInt(limit);
     const skip = (page - 1) * limit;
 
-    // 2️⃣ Build query filter
+    // 2. Search by Name OR Category
     let query = {};
-    if (category) {
-      query.category = { $regex: category, $options: "i" }; // case-insensitive search
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ];
     }
 
-    // 3️⃣ Build sort object
     let sortOption = {};
     if (sort === "asc") sortOption.pricePerKg = 1;
     else if (sort === "desc") sortOption.pricePerKg = -1;
 
-    // 4️⃣ Fetch products with filter, sort, and pagination
+    // 3. Execute Query
     const products = await Product.find(query)
       .sort(sortOption)
       .skip(skip)
-      .limit(Number(limit));
+      .limit(limit);
 
-    // 5️⃣ Get total count for pagination
     const totalCount = await Product.countDocuments(query);
 
-    // 6️⃣ Return response
-    res.json({ success: true, products, totalCount });
+    res.json({
+      success: true,
+      products,
+      totalCount,
+      totalPages: Math.ceil(totalCount / limit),
+      currentPage: page,
+    });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
   }

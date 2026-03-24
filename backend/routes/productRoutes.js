@@ -13,15 +13,19 @@ const { protect, admin } = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
-// ADMIN routes
+// --- ADMIN ROUTES ---
+// Move static admin routes to the top
+router.get("/admin/all", protect, admin, allProductsToAdmin);
 router.post("/bulk-add", protect, admin, addProducts);
 router.post("/", protect, admin, createProduct);
+
+// --- USER/PUBLIC ROUTES ---
+router.get("/", getProducts); // Publicly view all products (with your pagination)
+router.get("/:id", getProductById); // Publicly view a single product
+
+// --- PROTECTED ACTIONS ---
+// Put dynamic ID routes for admin at the bottom
 router.put("/:id", protect, admin, updateProduct);
 router.delete("/:id", protect, admin, deleteProduct);
-router.get("/admin/all", protect, admin, allProductsToAdmin);
-
-// USER routes
-router.get("/", getProducts);
-router.get("/:id", getProductById);
 
 module.exports = router;
