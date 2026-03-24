@@ -99,13 +99,12 @@ const allProductsToAdmin = async (req, res) => {
 
 const getProducts = async (req, res) => {
   try {
-    // 1. Get params and ensure they are Numbers
-    let { search, page = 1, limit = 6, sort } = req.query;
+    let { page = 1, limit = 6, sort, search } = req.query;
     page = parseInt(page);
     limit = parseInt(limit);
     const skip = (page - 1) * limit;
 
-    // 2. Search by Name OR Category
+    // Build the Search Query
     let query = {};
     if (search) {
       query.$or = [
@@ -118,12 +117,13 @@ const getProducts = async (req, res) => {
     if (sort === "asc") sortOption.pricePerKg = 1;
     else if (sort === "desc") sortOption.pricePerKg = -1;
 
-    // 3. Execute Query
+    // Fetch filtered products
     const products = await Product.find(query)
       .sort(sortOption)
       .skip(skip)
       .limit(limit);
 
+    // Get count based ON THE SEARCH QUERY
     const totalCount = await Product.countDocuments(query);
 
     res.json({
@@ -131,7 +131,6 @@ const getProducts = async (req, res) => {
       products,
       totalCount,
       totalPages: Math.ceil(totalCount / limit),
-      currentPage: page,
     });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
