@@ -1,22 +1,37 @@
 const Product = require("../models/productModel");
 const redis = require("redis");
 
-// 🚀 PRODUCTION-GRADE REDIS SETUP (With TLS for Cloud/Upstash)
+// 🚀 STABLE CLOUD REDIS SETUP
 const client = redis.createClient({
   url: process.env.REDIS_URL,
   socket: {
-    tls: true, // Upstash cloud ki idi kachithanga undali
-    rejectUnauthorized: false, // Connection errors thagginchadaniki
+    // tls: true,
+    rejectUnauthorized: false,
+    keepAlive: 5000, // Connection ni active ga ఉంచుతుంది
+    reconnectStrategy: (retries) => {
+      if (retries > 10) return new Error("Redis Max Retries Reached");
+      return Math.min(retries * 100, 3000); // Reconnect attempt faster ga chesthundi
+    },
   },
+  pingInterval: 1000, // Prathi second ki connection check chesthundhi
 });
 
-client.on("error", (err) => console.log("Redis Client Error", err));
+client.on("error", (err) => {
+  // Socket closed errors ni ignore chesi simplified log isthundi
+  if (err.message.includes("Socket closed")) {
+    console.log("🔄 Redis reconnecting...");
+  } else {
+    console.log("Redis Client Error", err);
+  }
+});
 
 // Connect to Redis
 (async () => {
   try {
-    await client.connect();
-    console.log("✅ Connected to Upstash Redis Successfully");
+    if (!client.isOpen) {
+      await client.connect();
+      console.log("✅ Connected to Upstash Redis Successfully");
+    }
   } catch (err) {
     console.error("❌ Redis Connection Failed:", err.message);
   }
@@ -26,7 +41,13 @@ client.on("error", (err) => console.log("Redis Client Error", err));
  * UTILITY: Clear Specific Cache
  */
 const clearCache = async (key) => {
-  if (client.isOpen) await client.del(key);
+  if (client.isOpen) {
+    try {
+      await client.del(key);
+    } catch (e) {
+      console.error("Cache clear error", e);
+    }
+  }
 };
 
 /**
@@ -43,10 +64,14 @@ const getProducts = async (req, res) => {
 
     // 1. Try fetching from Redis (Only if client is open)
     if (client.isOpen) {
-      const cachedData = await client.get(cacheKey);
-      if (cachedData) {
-        console.log("Serving from Redis Cache");
-        return res.json({ ...JSON.parse(cachedData), source: "cache" });
+      try {
+        const cachedData = await client.get(cacheKey);
+        if (cachedData) {
+          console.log("Serving from Redis Cache ⚡");
+          return res.json({ ...JSON.parse(cachedData), source: "cache" });
+        }
+      } catch (cacheErr) {
+        console.log("Redis Get Error:", cacheErr.message);
       }
     }
 
@@ -78,10 +103,14 @@ const getProducts = async (req, res) => {
 
     // 3. Store in Redis
     if (client.isOpen) {
-      await client.setEx(cacheKey, 600, JSON.stringify(responseData));
+      try {
+        await client.setEx(cacheKey, 600, JSON.stringify(responseData));
+      } catch (cacheSetErr) {
+        console.log("Redis Set Error:", cacheSetErr.message);
+      }
     }
 
-    console.log("Serving from MongoDB Database");
+    console.log("Serving from MongoDB Database 🗄️");
     res.json({ ...responseData, source: "database" });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
