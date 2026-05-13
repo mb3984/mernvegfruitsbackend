@@ -1,102 +1,29 @@
 const Product = require("../models/productModel");
+const redis = require("redis");
+
+// Redis Client Setup
+const client = redis.createClient({
+  url: "redis://127.0.0.1:6379", // Local Redis URL
+});
+
+client.on("error", (err) => console.log("Redis Client Error", err));
+
+// Connect to Redis
+(async () => {
+  await client.connect();
+  console.log("Connected to Redis Successfully");
+})();
 
 /**
- * ADMIN: Add multiple products (bulk upload)
+ * UTILITY: Clear Specific Cache
  */
-const addProducts = async (req, res) => {
-  try {
-    const products = await Product.insertMany(req.body);
-    res.status(201).json({ message: "Products added successfully", products });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error adding products", error: error.message });
-  }
+const clearCache = async (key) => {
+  await client.del(key);
 };
 
 /**
- * USER / ADMIN: Get single product by ID
+ * GET ALL PRODUCTS (with Search, Pagination & Redis Caching)
  */
-const getProductById = async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id);
-    if (!product) return res.status(404).json({ message: "Product not found" });
-
-    res.json({ success: true, product });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-};
-
-/**
- * ADMIN: Add single product
- */
-const createProduct = async (req, res) => {
-  try {
-    const product = await Product.create(req.body);
-    res.status(201).json(product);
-  } catch (error) {
-    res.status(500).json({ message: "Error creating product" });
-  }
-};
-
-/**
- * ADMIN: Update product (price, stock, etc.)
- */
-const updateProduct = async (req, res) => {
-  try {
-    const product = await Product.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-    });
-
-    if (!product) return res.status(404).json({ message: "Product not found" });
-
-    res.json(product);
-  } catch (error) {
-    res.status(500).json({ message: "Update failed" });
-  }
-};
-
-/**
- * ADMIN: Delete product
- */
-const deleteProduct = async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id);
-    if (!product) return res.status(404).json({ message: "Product not found" });
-
-    await product.deleteOne();
-    res.json({ message: "Product deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ message: "Delete failed" });
-  }
-};
-
-/**
- * ADMIN: Get all products
- */
-const allProductsToAdmin = async (req, res) => {
-  const products = await Product.find({});
-  res.json(products);
-};
-
-//   try {
-//     const { category, page = 1, limit = 6 } = req.query;
-//     const skip = (page - 1) * limit;
-
-//     let query = {};
-//     if (category) query.category = category; // Vegetable / Fruit
-
-//     const products = await Product.find(query).skip(skip).limit(Number(limit));
-
-//     const totalCount = await Product.countDocuments(query);
-
-//     res.json({ success: true, products, totalCount });
-//   } catch (error) {
-//     res.status(500).json({ message: "Server Error", error: error.message });
-//   }
-// };
-
 const getProducts = async (req, res) => {
   try {
     let { page = 1, limit = 6, sort, search } = req.query;
@@ -104,7 +31,17 @@ const getProducts = async (req, res) => {
     limit = parseInt(limit);
     const skip = (page - 1) * limit;
 
-    // Build the Search Query
+    // Unique Cache Key based on Query Params
+    const cacheKey = `products:page:${page}:limit:${limit}:sort:${sort}:search:${search}`;
+
+    // 1. Try fetching from Redis
+    const cachedData = await client.get(cacheKey);
+    if (cachedData) {
+      console.log("Serving from Redis Cache");
+      return res.json({ ...JSON.parse(cachedData), source: "cache" });
+    }
+
+    // 2. If not in cache, fetch from MongoDB
     let query = {};
     if (search) {
       query.$or = [
@@ -117,24 +54,129 @@ const getProducts = async (req, res) => {
     if (sort === "asc") sortOption.pricePerKg = 1;
     else if (sort === "desc") sortOption.pricePerKg = -1;
 
-    // Fetch filtered products
     const products = await Product.find(query)
       .sort(sortOption)
       .skip(skip)
       .limit(limit);
 
-    // Get count based ON THE SEARCH QUERY
     const totalCount = await Product.countDocuments(query);
-
-    res.json({
+    const responseData = {
       success: true,
       products,
       totalCount,
       totalPages: Math.ceil(totalCount / limit),
-    });
+    };
+
+    // 3. Store in Redis for 10 minutes (600 seconds)
+    await client.setEx(cacheKey, 600, JSON.stringify(responseData));
+
+    console.log("Serving from MongoDB Database");
+    res.json({ ...responseData, source: "database" });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
   }
+};
+
+/**
+ * GET SINGLE PRODUCT BY ID (with Caching)
+ */
+const getProductById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cacheKey = `product:${id}`;
+
+    const cachedProduct = await client.get(cacheKey);
+    if (cachedProduct) {
+      return res.json({
+        success: true,
+        product: JSON.parse(cachedProduct),
+        source: "cache",
+      });
+    }
+
+    const product = await Product.findById(id);
+    if (!product) return res.status(404).json({ message: "Product not found" });
+
+    await client.setEx(cacheKey, 3600, JSON.stringify(product)); // Cache for 1 hour
+
+    res.json({ success: true, product, source: "database" });
+  } catch (error) {
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+/**
+ * UPDATE PRODUCT (Clear Cache on Update)
+ */
+const updateProduct = async (req, res) => {
+  try {
+    const product = await Product.findByIdAndUpdate(req.params.id, req.body, {
+      new: true,
+    });
+    if (!product) return res.status(404).json({ message: "Product not found" });
+
+    // Invalidate Cache: Clear specific product and all lists
+    await client.del(`product:${req.params.id}`);
+
+    // Simple way: Clear all product lists because pagination/sort might change
+    const keys = await client.keys("products:page:*");
+    if (keys.length > 0) await client.del(keys);
+
+    res.json(product);
+  } catch (error) {
+    res.status(500).json({ message: "Update failed" });
+  }
+};
+
+/**
+ * DELETE PRODUCT (Clear Cache on Delete)
+ */
+const deleteProduct = async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ message: "Product not found" });
+
+    await product.deleteOne();
+
+    // Clear Cache
+    await client.del(`product:${req.params.id}`);
+    const keys = await client.keys("products:page:*");
+    if (keys.length > 0) await client.del(keys);
+
+    res.json({ message: "Product deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ message: "Delete failed" });
+  }
+};
+
+// Existing Admin functions (Can add cache clearing here too)
+const addProducts = async (req, res) => {
+  try {
+    const products = await Product.insertMany(req.body);
+    const keys = await client.keys("products:page:*");
+    if (keys.length > 0) await client.del(keys);
+    res.status(201).json({ message: "Products added successfully", products });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Error adding products", error: error.message });
+  }
+};
+
+const createProduct = async (req, res) => {
+  try {
+    const product = await Product.create(req.body);
+    const keys = await client.keys("products:page:*");
+    if (keys.length > 0) await client.del(keys);
+    res.status(201).json(product);
+  } catch (error) {
+    res.status(500).json({ message: "Error creating product" });
+  }
+};
+
+const allProductsToAdmin = async (req, res) => {
+  const products = await Product.find({});
+  res.json(products);
 };
 
 module.exports = {
