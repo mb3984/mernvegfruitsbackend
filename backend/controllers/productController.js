@@ -1,24 +1,32 @@
 const Product = require("../models/productModel");
 const redis = require("redis");
 
-// Redis Client Setup
+// 🚀 PRODUCTION-GRADE REDIS SETUP (With TLS for Cloud/Upstash)
 const client = redis.createClient({
-  url: "redis://127.0.0.1:6379", // Local Redis URL
+  url: process.env.REDIS_URL,
+  socket: {
+    tls: true, // Upstash cloud ki idi kachithanga undali
+    rejectUnauthorized: false, // Connection errors thagginchadaniki
+  },
 });
 
 client.on("error", (err) => console.log("Redis Client Error", err));
 
 // Connect to Redis
 (async () => {
-  await client.connect();
-  console.log("Connected to Redis Successfully");
+  try {
+    await client.connect();
+    console.log("✅ Connected to Upstash Redis Successfully");
+  } catch (err) {
+    console.error("❌ Redis Connection Failed:", err.message);
+  }
 })();
 
 /**
  * UTILITY: Clear Specific Cache
  */
 const clearCache = async (key) => {
-  await client.del(key);
+  if (client.isOpen) await client.del(key);
 };
 
 /**
@@ -31,17 +39,18 @@ const getProducts = async (req, res) => {
     limit = parseInt(limit);
     const skip = (page - 1) * limit;
 
-    // Unique Cache Key based on Query Params
     const cacheKey = `products:page:${page}:limit:${limit}:sort:${sort}:search:${search}`;
 
-    // 1. Try fetching from Redis
-    const cachedData = await client.get(cacheKey);
-    if (cachedData) {
-      console.log("Serving from Redis Cache");
-      return res.json({ ...JSON.parse(cachedData), source: "cache" });
+    // 1. Try fetching from Redis (Only if client is open)
+    if (client.isOpen) {
+      const cachedData = await client.get(cacheKey);
+      if (cachedData) {
+        console.log("Serving from Redis Cache");
+        return res.json({ ...JSON.parse(cachedData), source: "cache" });
+      }
     }
 
-    // 2. If not in cache, fetch from MongoDB
+    // 2. Fetch from MongoDB
     let query = {};
     if (search) {
       query.$or = [
@@ -67,8 +76,10 @@ const getProducts = async (req, res) => {
       totalPages: Math.ceil(totalCount / limit),
     };
 
-    // 3. Store in Redis for 10 minutes (600 seconds)
-    await client.setEx(cacheKey, 600, JSON.stringify(responseData));
+    // 3. Store in Redis
+    if (client.isOpen) {
+      await client.setEx(cacheKey, 600, JSON.stringify(responseData));
+    }
 
     console.log("Serving from MongoDB Database");
     res.json({ ...responseData, source: "database" });
@@ -78,26 +89,30 @@ const getProducts = async (req, res) => {
 };
 
 /**
- * GET SINGLE PRODUCT BY ID (with Caching)
+ * GET SINGLE PRODUCT BY ID
  */
 const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
     const cacheKey = `product:${id}`;
 
-    const cachedProduct = await client.get(cacheKey);
-    if (cachedProduct) {
-      return res.json({
-        success: true,
-        product: JSON.parse(cachedProduct),
-        source: "cache",
-      });
+    if (client.isOpen) {
+      const cachedProduct = await client.get(cacheKey);
+      if (cachedProduct) {
+        return res.json({
+          success: true,
+          product: JSON.parse(cachedProduct),
+          source: "cache",
+        });
+      }
     }
 
     const product = await Product.findById(id);
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    await client.setEx(cacheKey, 3600, JSON.stringify(product)); // Cache for 1 hour
+    if (client.isOpen) {
+      await client.setEx(cacheKey, 3600, JSON.stringify(product));
+    }
 
     res.json({ success: true, product, source: "database" });
   } catch (error) {
@@ -106,7 +121,7 @@ const getProductById = async (req, res) => {
 };
 
 /**
- * UPDATE PRODUCT (Clear Cache on Update)
+ * UPDATE PRODUCT (Cache Invalidation)
  */
 const updateProduct = async (req, res) => {
   try {
@@ -115,12 +130,11 @@ const updateProduct = async (req, res) => {
     });
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    // Invalidate Cache: Clear specific product and all lists
-    await client.del(`product:${req.params.id}`);
-
-    // Simple way: Clear all product lists because pagination/sort might change
-    const keys = await client.keys("products:page:*");
-    if (keys.length > 0) await client.del(keys);
+    if (client.isOpen) {
+      await client.del(`product:${req.params.id}`);
+      const keys = await client.keys("products:page:*");
+      if (keys.length > 0) await client.del(keys);
+    }
 
     res.json(product);
   } catch (error) {
@@ -129,7 +143,7 @@ const updateProduct = async (req, res) => {
 };
 
 /**
- * DELETE PRODUCT (Clear Cache on Delete)
+ * DELETE PRODUCT
  */
 const deleteProduct = async (req, res) => {
   try {
@@ -138,10 +152,11 @@ const deleteProduct = async (req, res) => {
 
     await product.deleteOne();
 
-    // Clear Cache
-    await client.del(`product:${req.params.id}`);
-    const keys = await client.keys("products:page:*");
-    if (keys.length > 0) await client.del(keys);
+    if (client.isOpen) {
+      await client.del(`product:${req.params.id}`);
+      const keys = await client.keys("products:page:*");
+      if (keys.length > 0) await client.del(keys);
+    }
 
     res.json({ message: "Product deleted successfully" });
   } catch (error) {
@@ -149,12 +164,13 @@ const deleteProduct = async (req, res) => {
   }
 };
 
-// Existing Admin functions (Can add cache clearing here too)
 const addProducts = async (req, res) => {
   try {
     const products = await Product.insertMany(req.body);
-    const keys = await client.keys("products:page:*");
-    if (keys.length > 0) await client.del(keys);
+    if (client.isOpen) {
+      const keys = await client.keys("products:page:*");
+      if (keys.length > 0) await client.del(keys);
+    }
     res.status(201).json({ message: "Products added successfully", products });
   } catch (error) {
     res
@@ -166,8 +182,10 @@ const addProducts = async (req, res) => {
 const createProduct = async (req, res) => {
   try {
     const product = await Product.create(req.body);
-    const keys = await client.keys("products:page:*");
-    if (keys.length > 0) await client.del(keys);
+    if (client.isOpen) {
+      const keys = await client.keys("products:page:*");
+      if (keys.length > 0) await client.del(keys);
+    }
     res.status(201).json(product);
   } catch (error) {
     res.status(500).json({ message: "Error creating product" });
